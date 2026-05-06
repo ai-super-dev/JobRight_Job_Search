@@ -116,7 +116,7 @@ export default function App() {
       {resumeData ? (
         <section className="card results">
           <h2 className="results-title">
-            Ranked jobs — {resumeData.searchTitle} —{" "}
+            Ranked jobs ({resumeData.count}) — {resumeData.searchTitle} —{" "}
             {TIME_WINDOW_OPTIONS.find((x) => x.value === resumeData.timeWindow)?.label ??
               resumeData.timeWindow}
           </h2>

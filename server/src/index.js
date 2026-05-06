@@ -43,6 +43,63 @@ function getWindowMs(input) {
   return TIME_WINDOW_MS[input.trim()] ?? null;
 }
 
+function compareJobsForRanking(a, b) {
+  if ((a?.matchScore ?? 0) !== (b?.matchScore ?? 0)) {
+    return (b?.matchScore ?? 0) - (a?.matchScore ?? 0);
+  }
+  const ar = a?.sectionScores?.requiredPreferred ?? 0;
+  const br = b?.sectionScores?.requiredPreferred ?? 0;
+  if (ar !== br) return br - ar;
+  const aq = a?.sectionScores?.qualifications ?? 0;
+  const bq = b?.sectionScores?.qualifications ?? 0;
+  if (aq !== bq) return bq - aq;
+  const at = parsePublishTime(a?.publishTime)?.getTime() ?? 0;
+  const bt = parsePublishTime(b?.publishTime)?.getTime() ?? 0;
+  return bt - at;
+}
+
+/**
+ * Keep one top-ranked job per company.
+ * If company name is missing, keep the row.
+ * @param {Array<any>} jobs
+ */
+function dedupeByCompanyHighestScore(jobs) {
+  const bestByCompany = new Map();
+  const noCompany = [];
+
+  for (const job of jobs) {
+    const companyRaw =
+      typeof job?.companyName === "string" ? job.companyName.trim() : "";
+    const key = companyRaw ? companyRaw.toLowerCase() : "";
+    if (!key) {
+      noCompany.push(job);
+      continue;
+    }
+
+    const prev = bestByCompany.get(key);
+    if (!prev || compareJobsForRanking(job, prev) < 0) {
+      bestByCompany.set(key, job);
+    }
+  }
+
+  return [...bestByCompany.values(), ...noCompany].sort(compareJobsForRanking);
+}
+
+/**
+ * Keep only jobs newer than selected window cutoff.
+ * @param {Array<any>} jobs
+ * @param {"24h"|"3d"|"7d"} timeWindow
+ */
+function filterJobsBySelectedWindow(jobs, timeWindow) {
+  const windowMs = getWindowMs(timeWindow);
+  if (!windowMs) return jobs;
+  const cutoffTs = Date.now() - windowMs;
+  return jobs.filter((j) => {
+    const t = parsePublishTime(j?.publishTime);
+    return t ? t.getTime() >= cutoffTs : false;
+  });
+}
+
 function buildSearchBody(jobTitle) {
   const t = jobTitle.trim();
   return {
@@ -241,7 +298,9 @@ app.post(
       const resumeHeadline = inferJobTitleFromResume(resumeText);
       const signals = extractResumeSignals(resumeText);
 
-      const rawJobs = await collectJobsForWindow(searchTitle, timeWindow.trim(), {
+      // Always gather 7d data so company de-duplication can protect outreach within a week.
+      // UI timeWindow is then applied after company-level de-duplication.
+      const rawJobs = await collectJobsForWindow(searchTitle, "7d", {
         keepDetail: true,
       });
 
@@ -291,6 +350,12 @@ app.post(
         })
         .sort((a, b) => b.matchScore - a.matchScore);
 
+      const dedupedJobs = dedupeByCompanyHighestScore(jobs);
+      const jobsInSelectedWindow = filterJobsBySelectedWindow(
+        dedupedJobs,
+        timeWindow.trim()
+      );
+
       res.json({
         jobTitleInput,
         searchTitle,
@@ -299,8 +364,11 @@ app.post(
         resumeSignals: signals,
         resumePreview: resumeText.slice(0, 320).replace(/\s+/g, " ").trim(),
         semanticUsed,
-        count: jobs.length,
-        jobs,
+        count: jobsInSelectedWindow.length,
+        companyDedupWindow: "7d",
+        totalBeforeCompanyDedup: jobs.length,
+        totalAfterCompanyDedup: dedupedJobs.length,
+        jobs: jobsInSelectedWindow,
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
