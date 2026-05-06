@@ -292,6 +292,110 @@ async function collectJobsForWindow(jobTitle, timeWindow, options = {}) {
   return out;
 }
 
+/**
+ * @param {Record<string, unknown>} body - multer fields
+ * @returns {string[]} unique non-empty titles in order
+ */
+function parseJobTitlesFromBody(body) {
+  const raw = body?.jobTitles;
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const out = [];
+        const seen = new Set();
+        for (const item of parsed) {
+          const t = String(item ?? "")
+            .trim()
+            .replace(/\s+/g, " ");
+          if (!t || seen.has(t.toLowerCase())) continue;
+          seen.add(t.toLowerCase());
+          out.push(t);
+        }
+        return out;
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+  const single = typeof body?.jobTitle === "string" ? body.jobTitle.trim().replace(/\s+/g, " ") : "";
+  return single ? [single] : [];
+}
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * One normalized title: collect → score → optional semantic → dedupe → time window.
+ * @param {string} resumeText
+ * @param {string} jobTitleInput
+ * @param {string} timeWindow
+ * @param {string[]} signals
+ */
+async function runResumeSearchForTitle(resumeText, jobTitleInput, timeWindow, signals) {
+  const searchTitle = normalizeJobSearchTitle(jobTitleInput);
+  const rawJobs = await collectJobsForWindow(searchTitle, "7d", {
+    keepDetail: true,
+  });
+
+  const textScored = rawJobs
+    .map((j) => {
+      const row = j._row;
+      const { _row, ...rest } = j;
+      const { score, matchedKeywords, breakdown } = scoreJobAgainstResume(
+        signals,
+        row,
+        resumeText
+      );
+      return {
+        ...rest,
+        matchScore: score,
+        sectionScores: breakdown,
+        textScore: score,
+        textSectionScores: breakdown,
+        matchedKeywords,
+      };
+    })
+    .sort((a, b) => b.matchScore - a.matchScore);
+
+  let semanticMap = new Map();
+  let semanticUsed = false;
+  try {
+    semanticMap = await computeSemanticSectionScores(rawJobs, resumeText);
+    semanticUsed = hasSemanticKey() && semanticMap.size > 0;
+  } catch {
+    semanticMap = new Map();
+    semanticUsed = false;
+  }
+
+  const jobs = textScored
+    .map((j) => {
+      const sem = semanticMap.get(j.jobId);
+      if (!sem) return j;
+      return {
+        ...j,
+        matchScore: sem.final,
+        sectionScores: {
+          responsibilities: sem.responsibilities,
+          qualifications: sem.qualifications,
+          requiredPreferred: sem.requiredPreferred,
+        },
+      };
+    })
+    .sort((a, b) => b.matchScore - a.matchScore);
+
+  const dedupedJobs = dedupeByCompanyAndTitleKeepOldest(jobs);
+  const jobsInSelectedWindow = filterJobsBySelectedWindow(dedupedJobs, timeWindow);
+
+  return {
+    jobTitleInput,
+    searchTitle,
+    semanticUsed,
+    totalBeforeCompanyDedup: jobs.length,
+    totalAfterCompanyDedup: dedupedJobs.length,
+    jobs: jobsInSelectedWindow,
+  };
+}
+
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: "32kb" }));
@@ -337,17 +441,16 @@ app.post(
   upload.single("resume"),
   async (req, res) => {
     const timeWindow = req.body?.timeWindow;
-    const jobTitleInput =
-      typeof req.body?.jobTitle === "string" ? req.body.jobTitle.trim() : "";
+    const jobTitles = parseJobTitlesFromBody(req.body);
 
     if (!req.file?.buffer) {
       res.status(400).json({ error: "Upload a PDF resume (field name: resume)." });
       return;
     }
-    if (!jobTitleInput) {
+    if (jobTitles.length === 0) {
       res.status(400).json({
         error:
-          "jobTitle is required: enter the role to search (e.g. Data Scientist, Machine Learning Engineer).",
+          "Add at least one job function / title (e.g. Data Scientist, Machine Learning Engineer).",
       });
       return;
     }
@@ -358,6 +461,8 @@ app.post(
       return;
     }
 
+    const tw = timeWindow.trim();
+
     try {
       const resumeText = await parseResumePdf(req.file.buffer);
       if (!resumeText || resumeText.trim().length < 40) {
@@ -367,80 +472,76 @@ app.post(
         return;
       }
 
-      const searchTitle = normalizeJobSearchTitle(jobTitleInput);
       const resumeHeadline = inferJobTitleFromResume(resumeText);
       const signals = extractResumeSignals(resumeText);
+      const resumePreview = resumeText.slice(0, 320).replace(/\s+/g, " ").trim();
 
-      // Always collect 7 days for de-duplication, regardless of selected display window.
-      const rawJobs = await collectJobsForWindow(searchTitle, "7d", {
-        keepDetail: true,
-      });
+      const resultsByTitle = [];
+      let semanticUsedAny = false;
 
-      const textScored = rawJobs
-        .map((j) => {
-          const row = j._row;
-          const { _row, ...rest } = j;
-          const { score, matchedKeywords, breakdown } = scoreJobAgainstResume(
-            signals,
-            row,
-            resumeText
-          );
-          return {
-            ...rest,
-            matchScore: score,
-            sectionScores: breakdown,
-            textScore: score,
-            textSectionScores: breakdown,
-            matchedKeywords,
-          };
-        })
-        .sort((a, b) => b.matchScore - a.matchScore);
-
-      let semanticMap = new Map();
-      let semanticUsed = false;
-      try {
-        semanticMap = await computeSemanticSectionScores(rawJobs, resumeText);
-        semanticUsed = hasSemanticKey() && semanticMap.size > 0;
-      } catch {
-        semanticMap = new Map();
-        semanticUsed = false;
+      for (let i = 0; i < jobTitles.length; i++) {
+        if (i > 0) await delay(200);
+        const block = await runResumeSearchForTitle(resumeText, jobTitles[i], tw, signals);
+        semanticUsedAny = semanticUsedAny || block.semanticUsed;
+        const jobsTagged = block.jobs.map((j) => ({
+          ...j,
+          queryJobTitle: block.jobTitleInput,
+          querySearchTitle: block.searchTitle,
+        }));
+        resultsByTitle.push({
+          jobTitleInput: block.jobTitleInput,
+          searchTitle: block.searchTitle,
+          count: jobsTagged.length,
+          companyTitleDedupWindow: "7d",
+          totalBeforeCompanyDedup: block.totalBeforeCompanyDedup,
+          totalAfterCompanyDedup: block.totalAfterCompanyDedup,
+          jobs: jobsTagged,
+        });
       }
 
-      const jobs = textScored
-        .map((j) => {
-          const sem = semanticMap.get(j.jobId);
-          if (!sem) return j;
-          return {
-            ...j,
-            matchScore: sem.final,
-            sectionScores: {
-              responsibilities: sem.responsibilities,
-              qualifications: sem.qualifications,
-              requiredPreferred: sem.requiredPreferred,
-            },
-          };
-        })
-        .sort((a, b) => b.matchScore - a.matchScore);
+      const seenIds = new Set();
+      const jobsFlat = [];
+      for (const block of resultsByTitle) {
+        for (const j of block.jobs) {
+          if (seenIds.has(j.jobId)) continue;
+          seenIds.add(j.jobId);
+          jobsFlat.push(j);
+        }
+      }
 
-      const dedupedJobs = dedupeByCompanyAndTitleKeepOldest(jobs);
-      const jobsInSelectedWindow = filterJobsBySelectedWindow(
-        dedupedJobs,
-        timeWindow.trim()
-      );
+      if (jobTitles.length === 1) {
+        const only = resultsByTitle[0];
+        res.json({
+          jobTitleInput: only.jobTitleInput,
+          searchTitle: only.searchTitle,
+          resumeHeadline,
+          timeWindow: tw,
+          resumeSignals: signals,
+          resumePreview,
+          semanticUsed: only.semanticUsed,
+          count: only.jobs.length,
+          companyTitleDedupWindow: "7d",
+          totalBeforeCompanyDedup: only.totalBeforeCompanyDedup,
+          totalAfterCompanyDedup: only.totalAfterCompanyDedup,
+          jobs: only.jobs.map(({ queryJobTitle, querySearchTitle, ...rest }) => rest),
+        });
+        return;
+      }
 
       res.json({
-        jobTitleInput,
-        searchTitle,
+        multiTitle: true,
+        jobTitlesInput: jobTitles,
+        jobTitleInput: jobTitles.join(", "),
+        searchTitle: resultsByTitle.map((r) => r.searchTitle).join(" · "),
         resumeHeadline,
-        timeWindow: timeWindow.trim(),
+        timeWindow: tw,
         resumeSignals: signals,
-        resumePreview: resumeText.slice(0, 320).replace(/\s+/g, " ").trim(),
-        semanticUsed,
-        count: jobsInSelectedWindow.length,
+        resumePreview,
+        semanticUsed: semanticUsedAny,
+        count: jobsFlat.length,
         companyTitleDedupWindow: "7d",
-        totalBeforeCompanyDedup: jobs.length,
-        totalAfterCompanyDedup: dedupedJobs.length,
-        jobs: jobsInSelectedWindow,
+        resultsByTitle,
+        jobs: jobsFlat,
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
