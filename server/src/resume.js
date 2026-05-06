@@ -256,10 +256,6 @@ export function extractLexicalTerms(text, maxTerms = 90) {
     .map(([w]) => w);
 }
 
-function escapeRe(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 /** Job posting text most relevant to “fit”: summary, requirements, responsibilities. */
 function jobDescriptionCorpusLower(row) {
   const jr = row?.jobResult;
@@ -298,50 +294,36 @@ export function scoreJobAgainstResume(signals, row, resumeText) {
   const jd = jdRaw || full;
   if (!jd && !full) return { score: 0, matchedKeywords: [] };
 
-  const lexical = extractLexicalTerms(resumeText, 100);
-  const matchedPhrases = [];
-  let phrasesInJd = 0;
+  // Phrase coverage denominator is now job-side:
+  // matched_resume_phrases_in_job / total_job_phrases_in_job
+  const resumeSignalsSet = new Set(signals);
+  const jobSignals = SKILL_PHRASES.filter((s) => jd.includes(s));
+  const matchedPhrases = jobSignals.filter((s) => resumeSignalsSet.has(s));
+  const phraseCoverage =
+    jobSignals.length > 0 ? matchedPhrases.length / jobSignals.length : 0;
 
-  for (const s of signals) {
-    if (!full.includes(s)) continue;
-    matchedPhrases.push(s);
-    const inDescription = jdRaw ? jdRaw.includes(s) : jd.includes(s);
-    if (inDescription) phrasesInJd++;
-  }
+  // Lexical coverage denominator is now job-side:
+  // matched_resume_terms_in_job / total_job_terms
+  const resumeLexical = new Set(extractLexicalTerms(resumeText, 120));
+  const jobLexical = extractLexicalTerms(jd, 120);
+  const lexMatched = jobLexical.filter((t) => resumeLexical.has(t));
+  const lexicalCoverage =
+    jobLexical.length > 0 ? lexMatched.length / jobLexical.length : 0;
 
-  const lexMatched = [];
-  const jdForWord = jd;
-  for (const term of lexical) {
-    try {
-      const re = new RegExp(`\\b${escapeRe(term)}\\b`, "i");
-      if (re.test(jdForWord)) lexMatched.push(term);
-    } catch {
-      /* ignore bad regex */
-    }
-  }
+  // Small bonus for richer overlap while keeping denominator job-side.
+  const overlapBonus = Math.min(
+    0.1,
+    0.04 * Math.min(1, matchedPhrases.length / 10) +
+      0.06 * Math.min(1, lexMatched.length / 20)
+  );
 
-  const denomPhrases = Math.max(signals.length, 10);
-  const phraseJdRatio = phrasesInJd / denomPhrases;
-  const phraseAnyRatio = matchedPhrases.length / denomPhrases;
-
-  const denomLex = Math.max(lexical.length, 20);
-  const lexRatio = lexMatched.length / denomLex;
-
-  let score;
-  if (signals.length === 0) {
-    score = Math.min(100, Math.round(100 * Math.min(1, (lexRatio * 1.15 + lexMatched.length / 35) / 1.15)));
-  } else {
-    score = Math.round(
-      100 *
-        Math.min(
-          1,
-          0.52 * phraseJdRatio +
-            0.18 * phraseAnyRatio +
-            0.28 * Math.min(1, lexRatio * 1.25) +
-            0.02 * Math.min(1, matchedPhrases.length / 12)
-        )
-    );
-  }
+  const score = Math.round(
+    100 *
+      Math.min(
+        1,
+        0.68 * phraseCoverage + 0.32 * lexicalCoverage + overlapBonus
+      )
+  );
 
   const seen = new Set();
   const matchedKeywords = [];
