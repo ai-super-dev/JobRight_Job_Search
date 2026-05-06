@@ -131,8 +131,9 @@ export default function App() {
         <h1>JobRight — ranked same-day matches</h1>
         <p className="lede">
           Add one or more job functions, choose a recent window (24h / 3d / 1w), upload your resume,
-          then search. Each title is queried in order on JobRight; results are ranked against your
-          resume. Links: <code>https://jobright.ai/jobs/info/&lt;id&gt;</code>.
+          then search. With <code>OPENAI_API_KEY</code> set, each function is expanded into related
+          JobRight title searches (e.g. ML engineer → machine learning roles), merged, then ranked
+          against your resume. Links: <code>https://jobright.ai/jobs/info/&lt;id&gt;</code>.
         </p>
         <p className="subtle">
           Fixed filters: Country US, US-remote only, job type in Full-time/Part-time/Contract, and
@@ -229,9 +230,10 @@ export default function App() {
               resumeData.timeWindow}
           </h2>
           <p className="resume-meta subtle">
-            Scoring weights the job summary, requirements, and responsibilities against your resume
-            (plus the job title). Higher % means stronger overlap. Each row shows 4 scores: final,
-            responsibilities, qualifications, and required/preferred.
+            Scoring weights the job summary, requirements, and responsibilities against your resume.
+            JobRight discovery uses multiple title strings per chip when AI expansion is enabled.
+            Higher % means stronger overlap. Each row shows 4 scores: final, responsibilities,
+            qualifications, and required/preferred.
             {resumeData.semanticUsed ? (
               <> Semantic mode: <strong>AI embeddings</strong>.</>
             ) : (
@@ -254,6 +256,44 @@ export default function App() {
               ))}
             </div>
           ) : null}
+          {!multi &&
+          resumeData.searchRoleTrack &&
+          resumeData.searchRoleTrack !== "generic" ? (
+            <p className="resume-meta subtle title-queries-note">
+              Role track: <strong>{resumeData.searchRoleTrack.replace(/_/g, " ")}</strong>
+              {resumeData.searchRoleTrack === "data_science" ? (
+                <>
+                  {" "}
+                  — job titles that are clearly Data Engineering (e.g. Data Engineer, data
+                  engineering without &quot;scientist&quot;) are excluded from this search.
+                </>
+              ) : (
+                <> — postings outside this lane are filtered by job title.</>
+              )}
+            </p>
+          ) : null}
+          {!multi &&
+          Array.isArray(resumeData.titleSearchQueries) &&
+          resumeData.titleSearchQueries.length > 0 ? (
+            <p className="resume-meta subtle title-queries-note">
+              <span className="signals-label">Title searches merged:</span>{" "}
+              {resumeData.titleSearchQueries.map((q) => (
+                <span key={q} className="tag small">
+                  {q}
+                </span>
+              ))}
+              {resumeData.titleExpansionUsedLlm === false ? (
+                <span className="muted-inline">
+                  {" "}
+                  (AI title expansion off — set <code>OPENAI_API_KEY</code> on the server for related
+                  roles.)
+                </span>
+              ) : null}
+            </p>
+          ) : null}
+          {multi && resumeData.finalCrossTitleDedup ? (
+            <p className="resume-meta subtle title-queries-note">{resumeData.finalCrossTitleDedup}</p>
+          ) : null}
           {multi && resumeData.resultsByTitle ? (
             <div className="multi-title-results">
               {resumeData.resultsByTitle.map((block) => (
@@ -261,9 +301,27 @@ export default function App() {
                   <h3 className="title-block-heading">
                     <span className="title-block-query">{block.jobTitleInput}</span>
                     <span className="title-block-meta subtle">
-                      → search &quot;{block.searchTitle}&quot; · {block.count} jobs
+                      → normalized &quot;{block.searchTitle}&quot; · {block.count} jobs
                     </span>
                   </h3>
+                  {block.searchRoleTrack && block.searchRoleTrack !== "generic" ? (
+                    <p className="title-block-queries subtle">
+                      Track: <strong>{block.searchRoleTrack.replace(/_/g, " ")}</strong>
+                      {block.searchRoleTrack === "data_science"
+                        ? " — data engineer / pure data-engineering titles excluded."
+                        : " — off-lane titles excluded."}
+                    </p>
+                  ) : null}
+                  {Array.isArray(block.titleSearchQueries) && block.titleSearchQueries.length > 0 ? (
+                    <p className="title-block-queries subtle">
+                      <span className="signals-label">Searches:</span>{" "}
+                      {block.titleSearchQueries.map((q) => (
+                        <span key={`${block.jobTitleInput}-${q}`} className="tag small">
+                          {q}
+                        </span>
+                      ))}
+                    </p>
+                  ) : null}
                   {block.jobs?.length > 0 ? (
                     <ul className="list">
                       {block.jobs.map((j) => (

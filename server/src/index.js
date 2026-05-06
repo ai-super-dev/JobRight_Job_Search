@@ -8,8 +8,14 @@ import {
   normalizeJobSearchTitle,
   extractResumeSignals,
   scoreJobAgainstResume,
+  inferSearchRoleTrack,
+  shouldExcludePostingForSearchTrack,
 } from "./resume.js";
-import { computeSemanticSectionScores, hasSemanticKey } from "./semantic.js";
+import {
+  computeSemanticSectionScores,
+  expandJobSearchQueries,
+  hasSemanticKey,
+} from "./semantic.js";
 
 const PORT = Number(process.env.PORT) || 8787;
 const SWAN = "https://swan-api.jobright.ai";
@@ -122,8 +128,21 @@ function isOlderThan(a, b) {
 }
 
 /**
- * Deduplicate by (company + job title) over a 7-day pool.
- * Keeps only the best-ranked job for each pair.
+ * Normalized company + posting job title key (same rules as dedupe).
+ * @param {{ companyName?: string | null, jobTitle?: string | null }} job
+ */
+function companyTitleDedupeKey(job) {
+  const companyRaw =
+    typeof job?.companyName === "string" ? job.companyName.trim() : "";
+  const titleRaw = typeof job?.jobTitle === "string" ? job.jobTitle.trim() : "";
+  const company = companyRaw.toLowerCase().replace(/\s+/g, " ");
+  const title = titleRaw.toLowerCase().replace(/\s+/g, " ");
+  if (!company || !title) return "";
+  return `${company}|||${title}`;
+}
+
+/**
+ * Deduplicate by (company + job title). Keeps the oldest posting (by publishTime) for each pair.
  * @param {Array<any>} jobs
  */
 function dedupeByCompanyAndTitleKeepOldest(jobs) {
@@ -131,13 +150,7 @@ function dedupeByCompanyAndTitleKeepOldest(jobs) {
   const noPairKey = [];
 
   for (const job of jobs) {
-    const companyRaw =
-      typeof job?.companyName === "string" ? job.companyName.trim() : "";
-    const titleRaw =
-      typeof job?.jobTitle === "string" ? job.jobTitle.trim() : "";
-    const company = companyRaw.toLowerCase().replace(/\s+/g, " ");
-    const title = titleRaw.toLowerCase().replace(/\s+/g, " ");
-    const key = company && title ? `${company}|||${title}` : "";
+    const key = companyTitleDedupeKey(job);
 
     if (!key) {
       noPairKey.push(job);
@@ -239,7 +252,9 @@ async function fetchVisitorSearchPage(body, position, count = 20) {
  * @param {{ keepDetail?: boolean }} [options]
  */
 async function collectJobsForWindow(jobTitle, timeWindow, options = {}) {
-  const { keepDetail = false } = options;
+  const { keepDetail = false, maxPages: maxPagesOpt } = options;
+  const maxPages =
+    typeof maxPagesOpt === "number" && maxPagesOpt > 0 ? Math.min(60, maxPagesOpt) : 60;
   const windowMs = getWindowMs(timeWindow);
   if (!windowMs) throw new Error("Invalid timeWindow.");
 
@@ -247,7 +262,6 @@ async function collectJobsForWindow(jobTitle, timeWindow, options = {}) {
   const body = buildSearchBody(jobTitle);
   const out = [];
   const pageSize = 20;
-  const maxPages = 60;
   let position = 0;
   let shouldStop = false;
 
@@ -325,6 +339,37 @@ function parseJobTitlesFromBody(body) {
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Run JobRight visitor search for several title strings (semantic expansion) and merge by jobId.
+ * @param {string} jobTitleInput
+ * @param {string} resumeText
+ * @param {"24h"|"3d"|"7d"} timeWindow
+ * @param {{ keepDetail?: boolean }} [options]
+ */
+async function collectJobsMergedWithTitleExpansion(jobTitleInput, resumeText, timeWindow, options) {
+  const { queries, usedLlm } = await expandJobSearchQueries(jobTitleInput, resumeText);
+  const merged = new Map();
+
+  for (let i = 0; i < queries.length; i++) {
+    if (i > 0) await delay(160);
+    const maxPages =
+      queries.length === 1 ? 60 : i === 0 ? 28 : Math.max(10, Math.min(20, Math.floor(48 / queries.length)));
+    const batch = await collectJobsForWindow(queries[i], timeWindow, {
+      ...options,
+      maxPages,
+    });
+    for (const job of batch) {
+      if (!merged.has(job.jobId)) merged.set(job.jobId, job);
+    }
+  }
+
+  return {
+    jobs: Array.from(merged.values()),
+    expandedQueries: queries,
+    titleExpansionUsedLlm: usedLlm,
+  };
+}
+
+/**
  * One normalized title: collect → score → optional semantic → dedupe → time window.
  * @param {string} resumeText
  * @param {string} jobTitleInput
@@ -333,11 +378,17 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
  */
 async function runResumeSearchForTitle(resumeText, jobTitleInput, timeWindow, signals) {
   const searchTitle = normalizeJobSearchTitle(jobTitleInput);
-  const rawJobs = await collectJobsForWindow(searchTitle, "7d", {
-    keepDetail: true,
-  });
+  const searchRoleTrack = inferSearchRoleTrack(jobTitleInput);
+  const { jobs: rawJobs, expandedQueries, titleExpansionUsedLlm } =
+    await collectJobsMergedWithTitleExpansion(jobTitleInput, resumeText, "7d", {
+      keepDetail: true,
+    });
 
-  const textScored = rawJobs
+  const rawJobsFiltered = rawJobs.filter(
+    (j) => !shouldExcludePostingForSearchTrack(searchRoleTrack, j.jobTitle)
+  );
+
+  const textScored = rawJobsFiltered
     .map((j) => {
       const row = j._row;
       const { _row, ...rest } = j;
@@ -360,7 +411,7 @@ async function runResumeSearchForTitle(resumeText, jobTitleInput, timeWindow, si
   let semanticMap = new Map();
   let semanticUsed = false;
   try {
-    semanticMap = await computeSemanticSectionScores(rawJobs, resumeText);
+    semanticMap = await computeSemanticSectionScores(rawJobsFiltered, resumeText);
     semanticUsed = hasSemanticKey() && semanticMap.size > 0;
   } catch {
     semanticMap = new Map();
@@ -389,6 +440,9 @@ async function runResumeSearchForTitle(resumeText, jobTitleInput, timeWindow, si
   return {
     jobTitleInput,
     searchTitle,
+    searchRoleTrack,
+    expandedQueries,
+    titleExpansionUsedLlm,
     semanticUsed,
     totalBeforeCompanyDedup: jobs.length,
     totalAfterCompanyDedup: dedupedJobs.length,
@@ -420,11 +474,16 @@ app.post("/api/jobs-by-day", async (req, res) => {
   }
 
   try {
-    // For non-resume endpoint, keep selected-window behavior with no cross-window dedupe.
-    const jobs = await collectJobsForWindow(jobTitle.trim(), timeWindow.trim());
+    const tw = timeWindow.trim();
+    const { jobs, expandedQueries, titleExpansionUsedLlm } =
+      await collectJobsMergedWithTitleExpansion(jobTitle.trim(), "", tw, {
+        keepDetail: false,
+      });
     res.json({
       jobTitle: jobTitle.trim(),
-      timeWindow: timeWindow.trim(),
+      timeWindow: tw,
+      titleSearchQueries: expandedQueries,
+      titleExpansionUsedLlm,
       count: jobs.length,
       totalBeforeCompanyDedup: jobs.length,
       totalAfterCompanyDedup: jobs.length,
@@ -491,12 +550,38 @@ app.post(
         resultsByTitle.push({
           jobTitleInput: block.jobTitleInput,
           searchTitle: block.searchTitle,
+          searchRoleTrack: block.searchRoleTrack,
+          titleSearchQueries: block.expandedQueries,
+          titleExpansionUsedLlm: block.titleExpansionUsedLlm,
           count: jobsTagged.length,
           companyTitleDedupWindow: "7d",
           totalBeforeCompanyDedup: block.totalBeforeCompanyDedup,
           totalAfterCompanyDedup: block.totalAfterCompanyDedup,
           jobs: jobsTagged,
         });
+      }
+
+      if (jobTitles.length > 1) {
+        const jobIdFirstBlockIndex = new Map();
+        resultsByTitle.forEach((block, idx) => {
+          for (const j of block.jobs) {
+            if (!jobIdFirstBlockIndex.has(j.jobId)) jobIdFirstBlockIndex.set(j.jobId, idx);
+          }
+        });
+
+        const flatForGlobal = resultsByTitle.flatMap((b) => b.jobs);
+        const globalCompanyTitleDeduped = dedupeByCompanyAndTitleKeepOldest(flatForGlobal);
+        const survivingJobIds = new Set(globalCompanyTitleDeduped.map((j) => j.jobId));
+
+        for (let idx = 0; idx < resultsByTitle.length; idx++) {
+          const block = resultsByTitle[idx];
+          const filtered = block.jobs.filter(
+            (j) =>
+              survivingJobIds.has(j.jobId) && jobIdFirstBlockIndex.get(j.jobId) === idx
+          );
+          block.jobs = filtered;
+          block.count = filtered.length;
+        }
       }
 
       const seenIds = new Set();
@@ -514,6 +599,9 @@ app.post(
         res.json({
           jobTitleInput: only.jobTitleInput,
           searchTitle: only.searchTitle,
+          searchRoleTrack: only.searchRoleTrack,
+          titleSearchQueries: only.expandedQueries,
+          titleExpansionUsedLlm: only.titleExpansionUsedLlm,
           resumeHeadline,
           timeWindow: tw,
           resumeSignals: signals,
@@ -533,6 +621,7 @@ app.post(
         jobTitlesInput: jobTitles,
         jobTitleInput: jobTitles.join(", "),
         searchTitle: resultsByTitle.map((r) => r.searchTitle).join(" · "),
+        titleExpansionUsedLlm: resultsByTitle.some((r) => r.titleExpansionUsedLlm),
         resumeHeadline,
         timeWindow: tw,
         resumeSignals: signals,
@@ -540,6 +629,8 @@ app.post(
         semanticUsed: semanticUsedAny,
         count: jobsFlat.length,
         companyTitleDedupWindow: "7d",
+        finalCrossTitleDedup:
+          "After all titles: one more pass on the combined list by company + job title (keep oldest publish time). Each surviving job is shown only under the first search title that returned it.",
         resultsByTitle,
         jobs: jobsFlat,
       });

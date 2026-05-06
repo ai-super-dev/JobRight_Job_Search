@@ -151,6 +151,74 @@ export function normalizeJobSearchTitle(title) {
   return t || title.trim();
 }
 
+/**
+ * Coarse role family for the user's search chip (used to avoid cross-track noise, e.g. DS vs DE).
+ * @param {string} jobTitleInput
+ * @returns {"data_science"|"data_engineering"|"data_analytics"|"ml_ai"|"generic"}
+ */
+export function inferSearchRoleTrack(jobTitleInput) {
+  const t = String(jobTitleInput || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+
+  if (
+    /\bdata\s+scientist\b/.test(t) ||
+    /\bresearch\s+scientist\b/.test(t) ||
+    /\bapplied\s+scientist\b/.test(t)
+  ) {
+    return "data_science";
+  }
+  if (
+    /\bdata\s+engineer\b/.test(t) ||
+    /\bdata\s+platform\b/.test(t) ||
+    /\bdata\s+pipeline\b/.test(t) ||
+    /\betl\b/.test(t)
+  ) {
+    return "data_engineering";
+  }
+  if (/\bmachine\s+learning\b/.test(t) || /\bml\s+engineer\b/.test(t) || /\bai\s+engineer\b/.test(t)) {
+    return "ml_ai";
+  }
+  if (/\bdata\s+analyst\b/.test(t) || /\bbi\s+analyst\b/.test(t) || /\bbusiness\s+analyst\b/.test(t)) {
+    return "data_analytics";
+  }
+  return "generic";
+}
+
+/**
+ * Drop postings that clearly belong to a different career track than the user's chip.
+ * @param {"data_science"|"data_engineering"|"data_analytics"|"ml_ai"|"generic"} track
+ * @param {string} postingTitle
+ */
+export function shouldExcludePostingForSearchTrack(track, postingTitle) {
+  if (!track || track === "generic" || !postingTitle) return false;
+  const j = String(postingTitle)
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+
+  if (track === "data_science") {
+    if (/\bdata\s+engineer(ing)?\b/.test(j)) return true;
+    if (/\bdata\s+engineering\b/.test(j) && !/\bscientist\b/.test(j) && !/\bscience\b/.test(j)) {
+      return true;
+    }
+    return false;
+  }
+
+  if (track === "data_engineering") {
+    if (/\bdata\s+scientist\b/.test(j) && !/\bengineer\b/.test(j)) return true;
+    return false;
+  }
+
+  if (track === "ml_ai") {
+    if (/\bdata\s+engineer(ing)?\b/.test(j) && !/(machine learning|\bml\b|ai|deep learning)/.test(j)) {
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
 export function inferJobTitleFromResume(text) {
   const lines = text
     .split(/\r?\n/)

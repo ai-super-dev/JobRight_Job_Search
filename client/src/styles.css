@@ -479,3 +479,9 @@ code {
   font-weight: 400;
   font-size: 0.88rem;
 }
+
+.title-queries-note,
+.title-block-queries {
+  margin: 0 0 0.75rem;
+  line-height: 1.55;
+}
