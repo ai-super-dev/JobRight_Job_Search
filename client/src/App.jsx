@@ -167,18 +167,20 @@ export default function App() {
                   ) : (
                     <span className="meta">{j.publishTime}</span>
                   )}
-                  {j.matchedKeywords?.length > 0 ? (
-                    <div className="matched">
-                      Overlap:{" "}
-                      {j.matchedKeywords.map((k) => (
-                        <span key={k} className="tag small">
-                          {k}
-                        </span>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="matched muted">Little text overlap with this posting.</div>
-                  )}
+                  {!resumeData.semanticUsed ? (
+                    j.matchedKeywords?.length > 0 ? (
+                      <div className="matched">
+                        Overlap:{" "}
+                        {j.matchedKeywords.map((k) => (
+                          <span key={k} className="tag small">
+                            {k}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="matched muted">Little text overlap with this posting.</div>
+                    )
+                  ) : null}
                 </li>
               ))}
             </ul>
