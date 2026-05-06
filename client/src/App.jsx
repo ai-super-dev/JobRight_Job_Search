@@ -1,16 +1,15 @@
 import { useMemo, useState } from "react";
 
-function todayLocalISODate() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
+const TIME_WINDOW_OPTIONS = [
+  { value: "1h", label: "Past 1 hour" },
+  { value: "24h", label: "Past 24 hours" },
+  { value: "3d", label: "Past 3 days" },
+  { value: "7d", label: "Past 1 week" },
+];
 
 export default function App() {
   const [jobTitle, setJobTitle] = useState("");
-  const [postedDate, setPostedDate] = useState(todayLocalISODate);
+  const [timeWindow, setTimeWindow] = useState("24h");
   const [resumeFile, setResumeFile] = useState(null);
 
   const [loading, setLoading] = useState(false);
@@ -39,7 +38,7 @@ export default function App() {
     try {
       const fd = new FormData();
       fd.append("resume", resumeFile);
-      fd.append("postedDate", postedDate);
+      fd.append("timeWindow", timeWindow);
       fd.append("jobTitle", jobTitle.trim());
       const res = await fetch(`${apiBase}/api/jobs-from-resume`, {
         method: "POST",
@@ -62,10 +61,10 @@ export default function App() {
       <header className="header">
         <h1>JobRight — ranked same-day matches</h1>
         <p className="lede">
-          Enter the role you want, choose the calendar day listings must have been posted, upload your
-          resume, then search. Results are jobs for that title on that date from JobRight, ordered by
-          how closely each posting&apos;s description aligns with your resume (skills, tools, and
-          keywords). Links: <code>https://jobright.ai/jobs/info/&lt;id&gt;</code>.
+          Enter the role you want, choose a recent window (1h / 24h / 3d / 1w), upload your resume,
+          then search. Results are jobs for that title within that window from JobRight, ordered by
+          how closely each posting&apos;s description aligns with your resume. Links:{" "}
+          <code>https://jobright.ai/jobs/info/&lt;id&gt;</code>.
         </p>
       </header>
 
@@ -83,14 +82,19 @@ export default function App() {
             />
           </li>
           <li className="step">
-            <span className="step-label">Posted date</span>
-            <input
+            <span className="step-label">Posted within</span>
+            <select
               className="input"
-              type="date"
-              value={postedDate}
-              onChange={(e) => setPostedDate(e.target.value)}
-              aria-label="Posted date"
-            />
+              value={timeWindow}
+              onChange={(e) => setTimeWindow(e.target.value)}
+              aria-label="Time window"
+            >
+              {TIME_WINDOW_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
           </li>
           <li className="step">
             <span className="step-label">Resume (PDF)</span>
@@ -113,7 +117,9 @@ export default function App() {
       {resumeData ? (
         <section className="card results">
           <h2 className="results-title">
-            Ranked jobs — {resumeData.searchTitle} — posted {resumeData.postedDate}
+            Ranked jobs — {resumeData.searchTitle} —{" "}
+            {TIME_WINDOW_OPTIONS.find((x) => x.value === resumeData.timeWindow)?.label ??
+              resumeData.timeWindow}
           </h2>
           <p className="resume-meta subtle">
             Scoring weights the job summary, requirements, and responsibilities against your resume
@@ -185,7 +191,7 @@ export default function App() {
               ))}
             </ul>
           ) : (
-            <p className="hint">No jobs on that date for this search title on JobRight.</p>
+            <p className="hint">No jobs in that time window for this search title on JobRight.</p>
           )}
         </section>
       ) : !loading && !error ? (

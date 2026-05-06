@@ -13,6 +13,12 @@ import { computeSemanticSectionScores, hasSemanticKey } from "./semantic.js";
 
 const PORT = Number(process.env.PORT) || 8787;
 const SWAN = "https://swan-api.jobright.ai";
+const TIME_WINDOW_MS = {
+  "1h": 60 * 60 * 1000,
+  "24h": 24 * 60 * 60 * 1000,
+  "3d": 3 * 24 * 60 * 60 * 1000,
+  "7d": 7 * 24 * 60 * 60 * 1000,
+};
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 8 * 1024 * 1024 },
@@ -25,9 +31,17 @@ const upload = multer({
 });
 
 /** @param {string} publishTime e.g. "2026-05-06 04:34:01" */
-function datePart(publishTime) {
+function parsePublishTime(publishTime) {
   if (!publishTime || typeof publishTime !== "string") return null;
-  return publishTime.split(" ")[0] || null;
+  const isoish = publishTime.replace(" ", "T");
+  const d = new Date(isoish);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+function getWindowMs(input) {
+  if (typeof input !== "string") return null;
+  return TIME_WINDOW_MS[input.trim()] ?? null;
 }
 
 function buildSearchBody(jobTitle) {
@@ -94,13 +108,17 @@ async function fetchVisitorSearchPage(body, position, count = 20) {
 }
 
 /**
- * Walk freshest-first pages until we pass the target calendar day.
+ * Walk freshest-first pages and keep only jobs newer than cutoff.
  * @param {string} jobTitle
- * @param {string} postedDate YYYY-MM-DD
+ * @param {"1h"|"24h"|"3d"|"7d"} timeWindow
  * @param {{ keepDetail?: boolean }} [options]
  */
-async function collectJobsForDay(jobTitle, postedDate, options = {}) {
+async function collectJobsForWindow(jobTitle, timeWindow, options = {}) {
   const { keepDetail = false } = options;
+  const windowMs = getWindowMs(timeWindow);
+  if (!windowMs) throw new Error("Invalid timeWindow.");
+
+  const cutoffTs = Date.now() - windowMs;
   const body = buildSearchBody(jobTitle);
   const out = [];
   const pageSize = 20;
@@ -119,9 +137,10 @@ async function collectJobsForDay(jobTitle, postedDate, options = {}) {
     for (const row of list) {
       const jr = row?.jobResult;
       if (!jr?.jobId || !jr.publishTime) continue;
-      const d = datePart(jr.publishTime);
-      if (!d) continue;
-      if (d === postedDate) {
+      const t = parsePublishTime(jr.publishTime);
+      if (!t) continue;
+
+      if (t.getTime() >= cutoffTs) {
         const url = `https://jobright.ai/jobs/info/${jr.jobId}`;
         const item = {
           jobId: jr.jobId,
@@ -130,18 +149,16 @@ async function collectJobsForDay(jobTitle, postedDate, options = {}) {
           publishTime: jr.publishTime,
           companyName: row?.companyResult?.companyName ?? null,
         };
-        if (keepDetail) {
-          item._row = row;
-        }
+        if (keepDetail) item._row = row;
         out.push(item);
-      } else if (d < postedDate) {
+      } else {
         shouldStop = true;
       }
     }
 
     const last = list[list.length - 1]?.jobResult?.publishTime;
-    const lastDay = datePart(last);
-    if (lastDay && lastDay < postedDate) shouldStop = true;
+    const lastTime = parsePublishTime(last);
+    if (lastTime && lastTime.getTime() < cutoffTs) shouldStop = true;
 
     position += pageSize;
   }
@@ -159,24 +176,24 @@ app.get("/health", (_req, res) => {
 
 app.post("/api/jobs-by-day", async (req, res) => {
   const jobTitle = req.body?.jobTitle ?? req.body?.title;
-  const postedDate = req.body?.postedDate ?? req.body?.date;
+  const timeWindow = req.body?.timeWindow;
 
   if (typeof jobTitle !== "string" || !jobTitle.trim()) {
     res.status(400).json({ error: "jobTitle is required (non-empty string)." });
     return;
   }
-  if (typeof postedDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(postedDate.trim())) {
+  if (!getWindowMs(timeWindow)) {
     res.status(400).json({
-      error: "postedDate is required as YYYY-MM-DD (e.g. 2026-05-06).",
+      error: "timeWindow is required: 1h, 24h, 3d, or 7d.",
     });
     return;
   }
 
   try {
-    const jobs = await collectJobsForDay(jobTitle.trim(), postedDate.trim());
+    const jobs = await collectJobsForWindow(jobTitle.trim(), timeWindow.trim());
     res.json({
       jobTitle: jobTitle.trim(),
-      postedDate: postedDate.trim(),
+      timeWindow: timeWindow.trim(),
       count: jobs.length,
       jobs,
     });
@@ -190,7 +207,7 @@ app.post(
   "/api/jobs-from-resume",
   upload.single("resume"),
   async (req, res) => {
-    const postedDate = req.body?.postedDate ?? req.body?.date;
+    const timeWindow = req.body?.timeWindow;
     const jobTitleInput =
       typeof req.body?.jobTitle === "string" ? req.body.jobTitle.trim() : "";
 
@@ -205,9 +222,9 @@ app.post(
       });
       return;
     }
-    if (typeof postedDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(postedDate.trim())) {
+    if (!getWindowMs(timeWindow)) {
       res.status(400).json({
-        error: "postedDate is required as YYYY-MM-DD (e.g. 2026-05-06).",
+        error: "timeWindow is required: 1h, 24h, 3d, or 7d.",
       });
       return;
     }
@@ -225,7 +242,7 @@ app.post(
       const resumeHeadline = inferJobTitleFromResume(resumeText);
       const signals = extractResumeSignals(resumeText);
 
-      const rawJobs = await collectJobsForDay(searchTitle, postedDate.trim(), {
+      const rawJobs = await collectJobsForWindow(searchTitle, timeWindow.trim(), {
         keepDetail: true,
       });
 
@@ -279,7 +296,7 @@ app.post(
         jobTitleInput,
         searchTitle,
         resumeHeadline,
-        postedDate: postedDate.trim(),
+        timeWindow: timeWindow.trim(),
         resumeSignals: signals,
         resumePreview: resumeText.slice(0, 320).replace(/\s+/g, " ").trim(),
         semanticUsed,
