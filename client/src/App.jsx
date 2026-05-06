@@ -1,7 +1,6 @@
 import { useMemo, useState } from "react";
 
 const TIME_WINDOW_OPTIONS = [
-  { value: "1h", label: "Past 1 hour" },
   { value: "24h", label: "Past 24 hours" },
   { value: "3d", label: "Past 3 days" },
   { value: "7d", label: "Past 1 week" },
@@ -61,7 +60,7 @@ export default function App() {
       <header className="header">
         <h1>JobRight — ranked same-day matches</h1>
         <p className="lede">
-          Enter the role you want, choose a recent window (1h / 24h / 3d / 1w), upload your resume,
+          Enter the role you want, choose a recent window (24h / 3d / 1w), upload your resume,
           then search. Results are jobs for that title within that window from JobRight, ordered by
           how closely each posting&apos;s description aligns with your resume. Links:{" "}
           <code>https://jobright.ai/jobs/info/&lt;id&gt;</code>.

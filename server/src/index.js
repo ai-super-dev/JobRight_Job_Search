@@ -14,7 +14,6 @@ import { computeSemanticSectionScores, hasSemanticKey } from "./semantic.js";
 const PORT = Number(process.env.PORT) || 8787;
 const SWAN = "https://swan-api.jobright.ai";
 const TIME_WINDOW_MS = {
-  "1h": 60 * 60 * 1000,
   "24h": 24 * 60 * 60 * 1000,
   "3d": 3 * 24 * 60 * 60 * 1000,
   "7d": 7 * 24 * 60 * 60 * 1000,
@@ -110,7 +109,7 @@ async function fetchVisitorSearchPage(body, position, count = 20) {
 /**
  * Walk freshest-first pages and keep only jobs newer than cutoff.
  * @param {string} jobTitle
- * @param {"1h"|"24h"|"3d"|"7d"} timeWindow
+ * @param {"24h"|"3d"|"7d"} timeWindow
  * @param {{ keepDetail?: boolean }} [options]
  */
 async function collectJobsForWindow(jobTitle, timeWindow, options = {}) {
@@ -184,7 +183,7 @@ app.post("/api/jobs-by-day", async (req, res) => {
   }
   if (!getWindowMs(timeWindow)) {
     res.status(400).json({
-      error: "timeWindow is required: 1h, 24h, 3d, or 7d.",
+      error: "timeWindow is required: 24h, 3d, or 7d.",
     });
     return;
   }
@@ -224,7 +223,7 @@ app.post(
     }
     if (!getWindowMs(timeWindow)) {
       res.status(400).json({
-        error: "timeWindow is required: 1h, 24h, 3d, or 7d.",
+        error: "timeWindow is required: 24h, 3d, or 7d.",
       });
       return;
     }
