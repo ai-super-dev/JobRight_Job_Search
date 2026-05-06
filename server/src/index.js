@@ -231,7 +231,7 @@ app.post(
         .map((j) => {
           const row = j._row;
           const { _row, ...rest } = j;
-          const { score, matchedKeywords } = scoreJobAgainstResume(
+          const { score, matchedKeywords, breakdown } = scoreJobAgainstResume(
             signals,
             row,
             resumeText
@@ -239,6 +239,7 @@ app.post(
           return {
             ...rest,
             matchScore: score,
+            sectionScores: breakdown,
             matchedKeywords,
           };
         })

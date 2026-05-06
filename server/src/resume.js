@@ -256,18 +256,6 @@ export function extractLexicalTerms(text, maxTerms = 90) {
     .map(([w]) => w);
 }
 
-/** Job posting text most relevant to “fit”: summary, requirements, responsibilities. */
-function jobDescriptionCorpusLower(row) {
-  const jr = row?.jobResult;
-  if (!jr) return "";
-  const parts = [
-    jr.jobSummary,
-    ...(Array.isArray(jr.requirements) ? jr.requirements : []),
-    ...(Array.isArray(jr.coreResponsibilities) ? jr.coreResponsibilities : []),
-  ];
-  return parts.filter(Boolean).join(" \n ").toLowerCase();
-}
-
 function jobFullCorpusLower(row) {
   const jr = row?.jobResult;
   if (!jr) return "";
@@ -281,58 +269,164 @@ function jobFullCorpusLower(row) {
   return parts.filter(Boolean).join(" \n ").toLowerCase();
 }
 
+function hasAnySkillPhrase(text) {
+  return SKILL_PHRASES.some((s) => text.includes(s));
+}
+
+function splitJobSections(row) {
+  const jr = row?.jobResult || {};
+  const summary = (jr.jobSummary || "").toLowerCase();
+  const requirements = Array.isArray(jr.requirements)
+    ? jr.requirements.map((x) => String(x || "").toLowerCase()).filter(Boolean)
+    : [];
+  const responsibilities = Array.isArray(jr.coreResponsibilities)
+    ? jr.coreResponsibilities.map((x) => String(x || "").toLowerCase()).filter(Boolean)
+    : [];
+
+  const requiredPreferredLines = [];
+  const qualificationLines = [];
+
+  for (const line of requirements) {
+    const isReqPref =
+      /\b(required|preferred|must have|nice to have|minimum|min\.?|at least|\d+\+?\s+years?)\b/i.test(
+        line
+      );
+    const isQual =
+      /\b(qualification|qualifications|skill|skills|proficient|knowledge|expertise|experience with|familiarity)\b/i.test(
+        line
+      ) || hasAnySkillPhrase(line);
+
+    if (isReqPref) requiredPreferredLines.push(line);
+    if (isQual || !isReqPref) qualificationLines.push(line);
+  }
+
+  const responsibilitiesText = responsibilities.join(" \n ") || summary;
+  const qualificationText =
+    qualificationLines.join(" \n ") || requirements.join(" \n ") || summary;
+  const requiredPreferredText =
+    requiredPreferredLines.join(" \n ") || requirements.join(" \n ") || summary;
+
+  return {
+    responsibilities: responsibilitiesText,
+    qualifications: qualificationText,
+    requiredPreferred: requiredPreferredText,
+  };
+}
+
+function sectionMatchScore(sectionText, resumeSignalsSet, resumeLexicalSet) {
+  const text = (sectionText || "").toLowerCase().trim();
+  if (!text) return { score: 0, matched: [], phraseCoverage: 0, lexicalCoverage: 0 };
+
+  const jobSignals = SKILL_PHRASES.filter((s) => text.includes(s));
+  const matchedPhrases = jobSignals.filter((s) => resumeSignalsSet.has(s));
+  const phraseCoverage =
+    jobSignals.length > 0 ? matchedPhrases.length / jobSignals.length : 0;
+
+  const jobLexical = extractLexicalTerms(text, 120);
+  const lexMatched = jobLexical.filter((t) => resumeLexicalSet.has(t));
+  const lexicalCoverage =
+    jobLexical.length > 0 ? lexMatched.length / jobLexical.length : 0;
+
+  const overlapBonus = Math.min(
+    0.08,
+    0.03 * Math.min(1, matchedPhrases.length / 8) +
+      0.05 * Math.min(1, lexMatched.length / 16)
+  );
+
+  const score = Math.round(
+    100 *
+      Math.min(1, 0.7 * phraseCoverage + 0.3 * lexicalCoverage + overlapBonus)
+  );
+
+  const seen = new Set();
+  const matched = [];
+  for (const k of [...matchedPhrases, ...lexMatched]) {
+    if (seen.has(k)) continue;
+    seen.add(k);
+    matched.push(k);
+    if (matched.length >= 18) break;
+  }
+
+  return {
+    score: Math.min(100, Math.max(0, score)),
+    matched,
+    phraseCoverage,
+    lexicalCoverage,
+  };
+}
+
 /**
  * Score resume ↔ job fit. Emphasizes overlap with the job description (not just the title).
  * @param {string[]} signals - structured phrases from resume
  * @param {object} row - visitor-search jobList item
  * @param {string} resumeText - full resume text
- * @returns {{ score: number, matchedKeywords: string[] }}
+ * @returns {{
+ *   score: number,
+ *   matchedKeywords: string[],
+ *   breakdown: {
+ *     responsibilities: number,
+ *     qualifications: number,
+ *     requiredPreferred: number
+ *   }
+ * }}
  */
 export function scoreJobAgainstResume(signals, row, resumeText) {
-  const jdRaw = jobDescriptionCorpusLower(row);
   const full = jobFullCorpusLower(row);
-  const jd = jdRaw || full;
-  if (!jd && !full) return { score: 0, matchedKeywords: [] };
+  if (!full) {
+    return {
+      score: 0,
+      matchedKeywords: [],
+      breakdown: { responsibilities: 0, qualifications: 0, requiredPreferred: 0 },
+    };
+  }
 
-  // Phrase coverage denominator is now job-side:
-  // matched_resume_phrases_in_job / total_job_phrases_in_job
+  const sections = splitJobSections(row);
   const resumeSignalsSet = new Set(signals);
-  const jobSignals = SKILL_PHRASES.filter((s) => jd.includes(s));
-  const matchedPhrases = jobSignals.filter((s) => resumeSignalsSet.has(s));
-  const phraseCoverage =
-    jobSignals.length > 0 ? matchedPhrases.length / jobSignals.length : 0;
+  const resumeLexicalSet = new Set(extractLexicalTerms(resumeText, 140));
 
-  // Lexical coverage denominator is now job-side:
-  // matched_resume_terms_in_job / total_job_terms
-  const resumeLexical = new Set(extractLexicalTerms(resumeText, 120));
-  const jobLexical = extractLexicalTerms(jd, 120);
-  const lexMatched = jobLexical.filter((t) => resumeLexical.has(t));
-  const lexicalCoverage =
-    jobLexical.length > 0 ? lexMatched.length / jobLexical.length : 0;
-
-  // Small bonus for richer overlap while keeping denominator job-side.
-  const overlapBonus = Math.min(
-    0.1,
-    0.04 * Math.min(1, matchedPhrases.length / 10) +
-      0.06 * Math.min(1, lexMatched.length / 20)
+  const responsibilities = sectionMatchScore(
+    sections.responsibilities,
+    resumeSignalsSet,
+    resumeLexicalSet
+  );
+  const qualifications = sectionMatchScore(
+    sections.qualifications,
+    resumeSignalsSet,
+    resumeLexicalSet
+  );
+  const requiredPreferred = sectionMatchScore(
+    sections.requiredPreferred,
+    resumeSignalsSet,
+    resumeLexicalSet
   );
 
+  // Final score weights section-specific fit.
   const score = Math.round(
-    100 *
-      Math.min(
-        1,
-        0.68 * phraseCoverage + 0.32 * lexicalCoverage + overlapBonus
-      )
+    0.2 * responsibilities.score +
+      0.35 * qualifications.score +
+      0.45 * requiredPreferred.score
   );
 
   const seen = new Set();
   const matchedKeywords = [];
-  for (const k of [...matchedPhrases, ...lexMatched]) {
+  for (const k of [
+    ...requiredPreferred.matched,
+    ...qualifications.matched,
+    ...responsibilities.matched,
+  ]) {
     if (seen.has(k)) continue;
     seen.add(k);
     matchedKeywords.push(k);
     if (matchedKeywords.length >= 22) break;
   }
 
-  return { score: Math.min(100, Math.max(0, score)), matchedKeywords };
+  return {
+    score: Math.min(100, Math.max(0, score)),
+    matchedKeywords,
+    breakdown: {
+      responsibilities: responsibilities.score,
+      qualifications: qualifications.score,
+      requiredPreferred: requiredPreferred.score,
+    },
+  };
 }

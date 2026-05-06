@@ -118,6 +118,8 @@ export default function App() {
           <p className="resume-meta subtle">
             Scoring weights the job summary, requirements, and responsibilities against your resume
             (plus the job title). Higher % means stronger overlap.
+            {" "}Each row shows 4 scores: final, responsibilities, qualifications, and
+            required/preferred.
             {resumeData.resumeHeadline &&
             resumeData.resumeHeadline.toLowerCase() !== resumeData.searchTitle?.toLowerCase() ? (
               <>
@@ -141,11 +143,18 @@ export default function App() {
               {resumeData.jobs.map((j) => (
                 <li key={j.jobId} className="row">
                   <div className="rank-line">
-                    <span className="score">{j.matchScore}%</span>
+                    <span className="score">Final {j.matchScore}%</span>
                     <a className="link" href={j.url} target="_blank" rel="noreferrer">
                       {j.jobTitle}
                     </a>
                   </div>
+                  {j.sectionScores ? (
+                    <div className="section-scores">
+                      <span className="tag small">Responsibilities {j.sectionScores.responsibilities}%</span>
+                      <span className="tag small">Qualifications {j.sectionScores.qualifications}%</span>
+                      <span className="tag small">Required/Preferred {j.sectionScores.requiredPreferred}%</span>
+                    </div>
+                  ) : null}
                   {j.companyName ? (
                     <span className="meta">
                       {j.companyName} · {j.publishTime}
