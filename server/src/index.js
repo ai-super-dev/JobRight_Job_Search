@@ -13,6 +13,17 @@ import { computeSemanticSectionScores, hasSemanticKey } from "./semantic.js";
 
 const PORT = Number(process.env.PORT) || 8787;
 const SWAN = "https://swan-api.jobright.ai";
+const DESIRED_JOB_TYPES = new Set(["full-time", "part-time", "contract"]);
+const DISALLOWED_SENIORITY_MARKERS = [
+  "intern",
+  "new grad",
+  "entry",
+  "mid",
+  "junior",
+  "jr",
+  "associate",
+];
+const ALLOWED_SENIORITY_MARKERS = ["senior", "lead/staff", "lead", "staff", "director/executive"];
 const TIME_WINDOW_MS = {
   "24h": 24 * 60 * 60 * 1000,
   "3d": 3 * 24 * 60 * 60 * 1000,
@@ -41,6 +52,46 @@ function parsePublishTime(publishTime) {
 function getWindowMs(input) {
   if (typeof input !== "string") return null;
   return TIME_WINDOW_MS[input.trim()] ?? null;
+}
+
+function normalizeField(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function isAllowedEmploymentType(value) {
+  const jobType = normalizeField(value);
+  return DESIRED_JOB_TYPES.has(jobType);
+}
+
+function isAllowedSeniority(value) {
+  const seniority = normalizeField(value);
+  if (!seniority) return false;
+  if (DISALLOWED_SENIORITY_MARKERS.some((x) => seniority.includes(x))) return false;
+  return ALLOWED_SENIORITY_MARKERS.some((x) => seniority.includes(x));
+}
+
+function isUsRemoteJob(jr) {
+  const workModel = normalizeField(jr?.workModel);
+  const location = normalizeField(jr?.jobLocation);
+  const isRemote = jr?.isRemote === true;
+
+  if (!(isRemote || workModel === "remote")) return false;
+
+  // Keep only US-wide remote jobs and city/state locations in the US.
+  if (!location) return false;
+  if (location.includes("united states") || location === "us" || location === "u.s.") {
+    return true;
+  }
+  return /,\s*[a-z]{2}$/i.test(location);
+}
+
+function matchesHardFilters(row) {
+  const jr = row?.jobResult;
+  if (!jr) return false;
+  if (!isUsRemoteJob(jr)) return false;
+  if (!isAllowedEmploymentType(jr.employmentType)) return false;
+  if (!isAllowedSeniority(jr.jobSeniority)) return false;
+  return true;
 }
 
 function compareJobsForDisplay(a, b) {
@@ -211,6 +262,7 @@ async function collectJobsForWindow(jobTitle, timeWindow, options = {}) {
     for (const row of list) {
       const jr = row?.jobResult;
       if (!jr?.jobId || !jr.publishTime) continue;
+      if (!matchesHardFilters(row)) continue;
       const t = parsePublishTime(jr.publishTime);
       if (!t) continue;
 

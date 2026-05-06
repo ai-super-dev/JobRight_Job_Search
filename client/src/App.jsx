@@ -65,6 +65,10 @@ export default function App() {
           how closely each posting&apos;s description aligns with your resume. Links:{" "}
           <code>https://jobright.ai/jobs/info/&lt;id&gt;</code>.
         </p>
+        <p className="subtle">
+          Fixed filters: Country US, US-remote only, job type in Full-time/Part-time/Contract, and
+          seniority at Senior/Lead/Staff+ (intern/entry/mid excluded).
+        </p>
       </header>
 
       <form className="card form search-flow" onSubmit={onSearch}>
