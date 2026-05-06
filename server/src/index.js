@@ -43,46 +43,64 @@ function getWindowMs(input) {
   return TIME_WINDOW_MS[input.trim()] ?? null;
 }
 
-function compareJobsForRanking(a, b) {
-  if ((a?.matchScore ?? 0) !== (b?.matchScore ?? 0)) {
-    return (b?.matchScore ?? 0) - (a?.matchScore ?? 0);
-  }
+function compareJobsForDisplay(a, b) {
+  const am = a?.matchScore ?? 0;
+  const bm = b?.matchScore ?? 0;
+  if (am !== bm) return bm - am;
+
   const ar = a?.sectionScores?.requiredPreferred ?? 0;
   const br = b?.sectionScores?.requiredPreferred ?? 0;
   if (ar !== br) return br - ar;
+
   const aq = a?.sectionScores?.qualifications ?? 0;
   const bq = b?.sectionScores?.qualifications ?? 0;
   if (aq !== bq) return bq - aq;
+
   const at = parsePublishTime(a?.publishTime)?.getTime() ?? 0;
   const bt = parsePublishTime(b?.publishTime)?.getTime() ?? 0;
   return bt - at;
 }
 
+function isOlderThan(a, b) {
+  const at = parsePublishTime(a?.publishTime)?.getTime();
+  const bt = parsePublishTime(b?.publishTime)?.getTime();
+  if (at == null && bt == null) return false;
+  if (at == null) return false;
+  if (bt == null) return true;
+  return at < bt;
+}
+
 /**
- * Keep one top-ranked job per company.
- * If company name is missing, keep the row.
+ * Deduplicate by (company + job title) over a 7-day pool.
+ * Keeps only the best-ranked job for each pair.
  * @param {Array<any>} jobs
  */
-function dedupeByCompanyHighestScore(jobs) {
-  const bestByCompany = new Map();
-  const noCompany = [];
+function dedupeByCompanyAndTitleKeepOldest(jobs) {
+  const bestByPair = new Map();
+  const noPairKey = [];
 
   for (const job of jobs) {
     const companyRaw =
       typeof job?.companyName === "string" ? job.companyName.trim() : "";
-    const key = companyRaw ? companyRaw.toLowerCase() : "";
+    const titleRaw =
+      typeof job?.jobTitle === "string" ? job.jobTitle.trim() : "";
+    const company = companyRaw.toLowerCase().replace(/\s+/g, " ");
+    const title = titleRaw.toLowerCase().replace(/\s+/g, " ");
+    const key = company && title ? `${company}|||${title}` : "";
+
     if (!key) {
-      noCompany.push(job);
+      noPairKey.push(job);
       continue;
     }
 
-    const prev = bestByCompany.get(key);
-    if (!prev || compareJobsForRanking(job, prev) < 0) {
-      bestByCompany.set(key, job);
+    const prev = bestByPair.get(key);
+    // De-dup rule: keep the oldest posting for the same (company + title).
+    if (!prev || isOlderThan(job, prev)) {
+      bestByPair.set(key, job);
     }
   }
 
-  return [...bestByCompany.values(), ...noCompany].sort(compareJobsForRanking);
+  return [...bestByPair.values(), ...noPairKey].sort(compareJobsForDisplay);
 }
 
 /**
@@ -246,11 +264,14 @@ app.post("/api/jobs-by-day", async (req, res) => {
   }
 
   try {
+    // For non-resume endpoint, keep selected-window behavior with no cross-window dedupe.
     const jobs = await collectJobsForWindow(jobTitle.trim(), timeWindow.trim());
     res.json({
       jobTitle: jobTitle.trim(),
       timeWindow: timeWindow.trim(),
       count: jobs.length,
+      totalBeforeCompanyDedup: jobs.length,
+      totalAfterCompanyDedup: jobs.length,
       jobs,
     });
   } catch (e) {
@@ -298,8 +319,7 @@ app.post(
       const resumeHeadline = inferJobTitleFromResume(resumeText);
       const signals = extractResumeSignals(resumeText);
 
-      // Always gather 7d data so company de-duplication can protect outreach within a week.
-      // UI timeWindow is then applied after company-level de-duplication.
+      // Always collect 7 days for de-duplication, regardless of selected display window.
       const rawJobs = await collectJobsForWindow(searchTitle, "7d", {
         keepDetail: true,
       });
@@ -350,7 +370,7 @@ app.post(
         })
         .sort((a, b) => b.matchScore - a.matchScore);
 
-      const dedupedJobs = dedupeByCompanyHighestScore(jobs);
+      const dedupedJobs = dedupeByCompanyAndTitleKeepOldest(jobs);
       const jobsInSelectedWindow = filterJobsBySelectedWindow(
         dedupedJobs,
         timeWindow.trim()
@@ -365,7 +385,7 @@ app.post(
         resumePreview: resumeText.slice(0, 320).replace(/\s+/g, " ").trim(),
         semanticUsed,
         count: jobsInSelectedWindow.length,
-        companyDedupWindow: "7d",
+        companyTitleDedupWindow: "7d",
         totalBeforeCompanyDedup: jobs.length,
         totalAfterCompanyDedup: dedupedJobs.length,
         jobs: jobsInSelectedWindow,
