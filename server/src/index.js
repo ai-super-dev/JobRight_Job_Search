@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import "dotenv/config";
 import {
   parseResumePdf,
   inferJobTitleFromResume,
@@ -8,6 +9,7 @@ import {
   extractResumeSignals,
   scoreJobAgainstResume,
 } from "./resume.js";
+import { computeSemanticSectionScores, hasSemanticKey } from "./semantic.js";
 
 const PORT = Number(process.env.PORT) || 8787;
 const SWAN = "https://swan-api.jobright.ai";
@@ -227,7 +229,7 @@ app.post(
         keepDetail: true,
       });
 
-      const jobs = rawJobs
+      const textScored = rawJobs
         .map((j) => {
           const row = j._row;
           const { _row, ...rest } = j;
@@ -240,7 +242,35 @@ app.post(
             ...rest,
             matchScore: score,
             sectionScores: breakdown,
+            textScore: score,
+            textSectionScores: breakdown,
             matchedKeywords,
+          };
+        })
+        .sort((a, b) => b.matchScore - a.matchScore);
+
+      let semanticMap = new Map();
+      let semanticUsed = false;
+      try {
+        semanticMap = await computeSemanticSectionScores(rawJobs, resumeText);
+        semanticUsed = hasSemanticKey() && semanticMap.size > 0;
+      } catch {
+        semanticMap = new Map();
+        semanticUsed = false;
+      }
+
+      const jobs = textScored
+        .map((j) => {
+          const sem = semanticMap.get(j.jobId);
+          if (!sem) return j;
+          return {
+            ...j,
+            matchScore: sem.final,
+            sectionScores: {
+              responsibilities: sem.responsibilities,
+              qualifications: sem.qualifications,
+              requiredPreferred: sem.requiredPreferred,
+            },
           };
         })
         .sort((a, b) => b.matchScore - a.matchScore);
@@ -252,6 +282,7 @@ app.post(
         postedDate: postedDate.trim(),
         resumeSignals: signals,
         resumePreview: resumeText.slice(0, 320).replace(/\s+/g, " ").trim(),
+        semanticUsed,
         count: jobs.length,
         jobs,
       });

@@ -120,6 +120,11 @@ export default function App() {
             (plus the job title). Higher % means stronger overlap.
             {" "}Each row shows 4 scores: final, responsibilities, qualifications, and
             required/preferred.
+            {resumeData.semanticUsed ? (
+              <> Semantic mode: <strong>AI embeddings</strong>.</>
+            ) : (
+              <> Semantic mode: <strong>off</strong> (fallback text overlap).</>
+            )}
             {resumeData.resumeHeadline &&
             resumeData.resumeHeadline.toLowerCase() !== resumeData.searchTitle?.toLowerCase() ? (
               <>

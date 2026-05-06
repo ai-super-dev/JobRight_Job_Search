@@ -273,7 +273,7 @@ function hasAnySkillPhrase(text) {
   return SKILL_PHRASES.some((s) => text.includes(s));
 }
 
-function splitJobSections(row) {
+export function splitJobSections(row) {
   const jr = row?.jobResult || {};
   const summary = (jr.jobSummary || "").toLowerCase();
   const requirements = Array.isArray(jr.requirements)
