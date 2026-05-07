@@ -219,6 +219,59 @@ export function shouldExcludePostingForSearchTrack(track, postingTitle) {
   return false;
 }
 
+/** @param {string} jobSeniority e.g. "Senior Level, Lead/Staff" */
+function inferJobPostingSeniorityTier(jobSeniority) {
+  const s = String(jobSeniority || "").toLowerCase();
+  if (/\bintern\b|\bnew grad\b/.test(s)) return 0;
+  if (/\bentry\b/.test(s) && !/\bmid\b/.test(s)) return 1;
+  if (/\bmid\b/.test(s) && !/\b(senior|lead|staff|director|executive)\b/.test(s)) return 2;
+  if (/\b(senior|sr\.)\b/.test(s) && !/\b(lead|staff|principal|director|executive)\b/.test(s)) return 3;
+  if (/\b(lead|staff|principal)\b/.test(s) && !/\b(director|executive)\b/.test(s)) return 4;
+  if (/\b(director|executive)\b/.test(s)) return 5;
+  if (/\bsenior\b/.test(s)) return 3;
+  return 2;
+}
+
+function inferResumeSeniorityTier(resumeLower) {
+  const r = resumeLower;
+  let t = 2;
+  if (/\b(intern|internship|new grad|recent graduate)\b/.test(r)) t = Math.min(t, 0);
+  if (/\b(principal|distinguished|fellow|director|vice president|vp|head of)\b/.test(r)) {
+    t = Math.max(t, 5);
+  } else if (/\b(staff|lead technical|tech lead|engineering manager)\b/.test(r)) {
+    t = Math.max(t, 4);
+  } else if (/\b(senior|sr\.)\b/.test(r)) {
+    t = Math.max(t, 3);
+  } else if (/\b(junior|jr\.|associate|entry level)\b/.test(r)) {
+    t = Math.min(t, 1);
+  }
+  const yearHits = [...r.matchAll(/\b(\d{1,2})\s*\+?\s*years?\b/g)].map((m) => parseInt(m[1], 10));
+  const y = yearHits.length ? Math.max(...yearHits) : 0;
+  if (y >= 10) t = Math.max(t, 4);
+  else if (y >= 6) t = Math.max(t, 3);
+  else if (y >= 3) t = Math.max(t, 2);
+  return Math.min(5, Math.max(0, t));
+}
+
+/**
+ * 0–100 alignment between resume seniority cues and JobRight posting seniority label (ATS-style "level" fit).
+ * @param {string} resumeText
+ * @param {string | null | undefined} jobSeniority
+ */
+export function estimateSeniorityAlignmentScore(resumeText, jobSeniority) {
+  const r = String(resumeText || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+  const need = inferJobPostingSeniorityTier(jobSeniority);
+  const have = inferResumeSeniorityTier(r);
+  if (have >= need) {
+    const slack = have - need;
+    return Math.min(100, Math.round(86 + Math.min(14, slack * 2.5)));
+  }
+  const gap = need - have;
+  return Math.max(22, Math.round(78 - gap * 13));
+}
+
 export function inferJobTitleFromResume(text) {
   const lines = text
     .split(/\r?\n/)
@@ -424,10 +477,66 @@ function sectionMatchScore(sectionText, resumeSignalsSet, resumeLexicalSet) {
 }
 
 /**
+ * How well the posting title aligns with the user's search chip (normalized).
+ * @returns {number} 0–100
+ */
+function jobTitleSearchAlignment(searchNorm, postingTitle) {
+  const q = (searchNorm || "").toLowerCase().trim();
+  const j = (postingTitle || "").toLowerCase().trim();
+  if (!q || !j) return 72;
+  if (j.includes(q) || q.includes(j)) return 100;
+
+  const qa = new Set(q.split(/\s+/).filter((w) => w.length > 2));
+  const jb = new Set(j.split(/\s+/).filter((w) => w.length > 2));
+  if (qa.size === 0) return 72;
+  let overlap = 0;
+  for (const t of qa) if (jb.has(t)) overlap += 1;
+  const ratio = overlap / qa.size;
+  if (ratio >= 0.55) return 96;
+  if (ratio >= 0.34) return 78;
+  if (ratio > 0) return 52;
+
+  if (/\bdata\s+scientist\b/.test(q) && /\b(scientist|science)\b/.test(j) && /\b(data|research|applied|machine|learning|analytics|ai)\b/.test(j)) {
+    return 86;
+  }
+  if (/\bmachine\s+learning\b/.test(q) || /\bml\b/.test(q)) {
+    if (/(machine learning|deep learning|\bml\b|ai engineer|applied scientist)/.test(j)) return 84;
+  }
+  return 34;
+}
+
+/** Strong penalty when the posting is clearly a different professional lane than a technical search. */
+function jobTitleOffLaneMultiplier(searchNorm, postingTitle) {
+  const q = (searchNorm || "").toLowerCase();
+  const j = (postingTitle || "").toLowerCase();
+  if (!q) return 1;
+  const techSearch =
+    /\b(data scientist|data analyst|data engineer|machine learning|research scientist|applied scientist|ml engineer|ai engineer|analytics)\b/.test(
+      q
+    );
+  if (!techSearch) return 1;
+  if (
+    /\b(product owner|product manager|project manager|program manager|scrum master|delivery manager)\b/.test(
+      j
+    )
+  ) {
+    return 0.38;
+  }
+  if (/\b(recruiter|talent acquisition|sourcer|hr business partner|human resources)\b/.test(j)) {
+    return 0.35;
+  }
+  if (/\b(account executive|sales director|business development|customer success|account manager)\b/.test(j)) {
+    return 0.45;
+  }
+  return 1;
+}
+
+/**
  * Score resume ↔ job fit. Emphasizes overlap with the job description (not just the title).
  * @param {string[]} signals - structured phrases from resume
  * @param {object} row - visitor-search jobList item
  * @param {string} resumeText - full resume text
+ * @param {string} [searchQueryTitle] - normalized search chip (e.g. from normalizeJobSearchTitle); used to down-rank title/role mismatches
  * @returns {{
  *   score: number,
  *   matchedKeywords: string[],
@@ -438,7 +547,7 @@ function sectionMatchScore(sectionText, resumeSignalsSet, resumeLexicalSet) {
  *   }
  * }}
  */
-export function scoreJobAgainstResume(signals, row, resumeText) {
+export function scoreJobAgainstResume(signals, row, resumeText, searchQueryTitle = "") {
   const full = jobFullCorpusLower(row);
   if (!full) {
     return {
@@ -468,12 +577,28 @@ export function scoreJobAgainstResume(signals, row, resumeText) {
     resumeLexicalSet
   );
 
-  // Final score weights section-specific fit.
-  const score = Math.round(
-    0.2 * responsibilities.score +
-      0.35 * qualifications.score +
+  // Weighted blend + weakest-section floor (similar in spirit to JobRight lowering overall when "Skill" is weak).
+  const linear = Math.round(
+    0.22 * responsibilities.score +
+      0.33 * qualifications.score +
       0.45 * requiredPreferred.score
   );
+  const minSec = Math.min(
+    responsibilities.score,
+    qualifications.score,
+    requiredPreferred.score
+  );
+  // If one section is nearly empty in the API payload, minSec≈0 would crush good roles — ignore floor then.
+  let score =
+    minSec < 8
+      ? linear
+      : Math.round(0.72 * linear + 0.28 * minSec);
+
+  const jr = row?.jobResult || {};
+  const align = jobTitleSearchAlignment(searchQueryTitle, jr.jobTitle || "");
+  const offLane = jobTitleOffLaneMultiplier(searchQueryTitle, jr.jobTitle || "");
+  const titleFactor = Math.max(0.35, (0.38 + 0.62 * (align / 100)) * offLane);
+  score = Math.round(score * titleFactor);
 
   const seen = new Set();
   const matchedKeywords = [];

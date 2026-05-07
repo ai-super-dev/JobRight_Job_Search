@@ -10,7 +10,7 @@ function normalizeTitleInput(s) {
   return s.trim().replace(/\s+/g, " ");
 }
 
-function JobRow({ job, semanticUsed }) {
+function JobRow({ job, semanticUsed, semanticAtsMode }) {
   const j = job;
   return (
     <li className="row">
@@ -22,9 +22,21 @@ function JobRow({ job, semanticUsed }) {
       </div>
       {j.sectionScores ? (
         <div className="section-scores">
-          <span className="tag small">Responsibilities {j.sectionScores.responsibilities}%</span>
-          <span className="tag small">Qualifications {j.sectionScores.qualifications}%</span>
-          <span className="tag small">Required/Preferred {j.sectionScores.requiredPreferred}%</span>
+          {semanticAtsMode ? (
+            <>
+              <span className="tag small">
+                Skills &amp; requirements {j.sectionScores.qualifications}%
+              </span>
+              <span className="tag small">Role content {j.sectionScores.responsibilities}%</span>
+              <span className="tag small">Seniority / level {j.sectionScores.requiredPreferred}%</span>
+            </>
+          ) : (
+            <>
+              <span className="tag small">Responsibilities {j.sectionScores.responsibilities}%</span>
+              <span className="tag small">Qualifications {j.sectionScores.qualifications}%</span>
+              <span className="tag small">Required/Preferred {j.sectionScores.requiredPreferred}%</span>
+            </>
+          )}
         </div>
       ) : null}
       {j.companyName ? (
@@ -34,7 +46,7 @@ function JobRow({ job, semanticUsed }) {
       ) : (
         <span className="meta">{j.publishTime}</span>
       )}
-      {!semanticUsed ? (
+      {!semanticUsed && !semanticAtsMode ? (
         j.matchedKeywords?.length > 0 ? (
           <div className="matched">
             Overlap:{" "}
@@ -230,14 +242,20 @@ export default function App() {
               resumeData.timeWindow}
           </h2>
           <p className="resume-meta subtle">
-            Scoring weights the job summary, requirements, and responsibilities against your resume.
-            JobRight discovery uses multiple title strings per chip when AI expansion is enabled.
-            Higher % means stronger overlap. Each row shows 4 scores: final, responsibilities,
-            qualifications, and required/preferred.
-            {resumeData.semanticUsed ? (
-              <> Semantic mode: <strong>AI embeddings</strong>.</>
+            JobRight discovery can use multiple title strings per chip when AI expansion is enabled.
+            {resumeData.semanticAtsMode ? (
+              <>
+                {" "}
+                <strong>ATS-style semantic scoring</strong> (with <code>OPENAI_API_KEY</code>): final
+                % blends skill/requirements embedding fit, role-content embedding fit, and a
+                seniority heuristic vs the posting&apos;s level label — then a small text overlap
+                tie-break. This is <em>not</em> JobRight&apos;s proprietary match; it approximates
+                an ATS-style breakdown.
+              </>
+            ) : resumeData.semanticUsed ? (
+              <> Semantic mode: <strong>section embeddings</strong> (legacy blend with text).</>
             ) : (
-              <> Semantic mode: <strong>off</strong> (fallback text overlap).</>
+              <> Scoring uses <strong>text overlap</strong> on the posting (no API key).</>
             )}
             {resumeData.resumeHeadline ? (
               <>
@@ -329,6 +347,7 @@ export default function App() {
                           key={`${block.searchTitle}-${j.jobId}`}
                           job={j}
                           semanticUsed={resumeData.semanticUsed}
+                          semanticAtsMode={Boolean(block.semanticAtsMode ?? resumeData.semanticAtsMode)}
                         />
                       ))}
                     </ul>
@@ -341,7 +360,12 @@ export default function App() {
           ) : resumeData.jobs?.length > 0 ? (
             <ul className="list">
               {resumeData.jobs.map((j) => (
-                <JobRow key={j.jobId} job={j} semanticUsed={resumeData.semanticUsed} />
+                <JobRow
+                  key={j.jobId}
+                  job={j}
+                  semanticUsed={resumeData.semanticUsed}
+                  semanticAtsMode={Boolean(resumeData.semanticAtsMode)}
+                />
               ))}
             </ul>
           ) : (

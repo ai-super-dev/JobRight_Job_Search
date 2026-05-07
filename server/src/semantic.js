@@ -3,6 +3,7 @@ import {
   splitJobSections,
   normalizeJobSearchTitle,
   inferSearchRoleTrack,
+  estimateSeniorityAlignmentScore,
 } from "./resume.js";
 
 function clamp01(n) {
@@ -27,8 +28,69 @@ function cosineSimilarity(a, b) {
 }
 
 function toPercentFromCosine(cos) {
-  // cosine [-1,1] -> [0,100]
-  return Math.round(clamp01((cos + 1) / 2) * 100);
+  // cosine [-1,1] -> [0,100]; light compression only (short JD sections already score low on cosine)
+  const t = clamp01((cos + 1) / 2);
+  const adjusted = Math.pow(t, 1.1);
+  return Math.round(adjusted * 100);
+}
+
+/** Calibrated 0–100 for ATS-style "skill / content" dimensions from embedding cosine. */
+function cosineToAtsDimensionPercent(cos) {
+  const sim = clamp01((cos + 1) / 2);
+  if (sim < 0.4) return Math.round((sim / 0.4) * 46);
+  if (sim < 0.76) return Math.round(46 + ((sim - 0.4) / 0.36) * 42);
+  return Math.round(Math.min(98, 88 + ((sim - 0.76) / 0.24) * 10));
+}
+
+function embeddingSafeText(s, maxLen) {
+  const t = String(s || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+  return t.length >= 12 ? t : "Insufficient text for matching.";
+}
+
+function buildResumeSkillDocument(signals, resumeText) {
+  const sig =
+    Array.isArray(signals) && signals.length > 0
+      ? `Structured resume signals (tools, methods, domains):\n${signals.slice(0, 60).join(", ")}\n\n`
+      : "";
+  const body = embeddingSafeText(resumeText, 7500);
+  return embeddingSafeText(`${sig}Resume (professional content):\n${body}`, 12000);
+}
+
+function buildResumeRoleDocument(resumeText) {
+  return embeddingSafeText(
+    `Resume narrative for role and responsibilities fit:\n${String(resumeText || "").replace(/\s+/g, " ").trim()}`,
+    9000
+  );
+}
+
+function buildJobSkillDocument(row) {
+  const jr = row?.jobResult || {};
+  const sec = splitJobSections(row);
+  const title = (jr.jobTitle || "").trim();
+  const parts = [
+    `Posting title: ${title}`,
+    "Qualifications, requirements, and must-have skills:",
+    sec.qualifications || "",
+    sec.requiredPreferred || "",
+  ];
+  const out = parts.filter(Boolean).join("\n\n");
+  return embeddingSafeText(out || (jr.jobSummary || title), 9500);
+}
+
+function buildJobRoleDocument(row) {
+  const jr = row?.jobResult || {};
+  const sec = splitJobSections(row);
+  const summary = (jr.jobSummary || "").trim();
+  const parts = [
+    `Posting title: ${(jr.jobTitle || "").trim()}`,
+    "Core responsibilities and day-to-day work:",
+    sec.responsibilities || "",
+    summary ? `Role summary:\n${summary}` : "",
+  ];
+  return embeddingSafeText(parts.filter(Boolean).join("\n\n"), 9500);
 }
 
 export function hasSemanticKey() {
@@ -95,6 +157,77 @@ export async function computeSemanticSectionScores(rawJobs, resumeText) {
     );
     out.set(jobId, { ...s, final });
   }
+  return out;
+}
+
+const EMBED_MODEL = process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
+const ATS_JOB_BATCH = 16;
+
+/**
+ * ATS-style match: separate embeddings for (resume skills+signals vs job requirements)
+ * and (resume narrative vs job responsibilities), plus a seniority heuristic from JobRight labels.
+ *
+ * @param {Array<{jobId: string, _row: any}>} rawJobs
+ * @param {string} resumeText
+ * @param {string[]} signals - from extractResumeSignals(resumeText)
+ * @returns {Promise<Map<string, { skillsMatch: number, roleContentMatch: number, seniorityMatch: number, overall: number }>>}
+ */
+export async function computeSemanticAtsMatchScores(rawJobs, resumeText, signals) {
+  if (!hasSemanticKey() || !Array.isArray(rawJobs) || rawJobs.length === 0) {
+    return new Map();
+  }
+
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const resumeSkillDoc = buildResumeSkillDocument(signals, resumeText);
+  const resumeRoleDoc = buildResumeRoleDocument(resumeText);
+
+  const embResume = await client.embeddings.create({
+    model: EMBED_MODEL,
+    input: [resumeSkillDoc, resumeRoleDoc],
+  });
+  const resumeSkillVec = embResume.data[0].embedding;
+  const resumeRoleVec = embResume.data[1].embedding;
+
+  const out = new Map();
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  for (let i = 0; i < rawJobs.length; i += ATS_JOB_BATCH) {
+    if (i > 0) await delay(140);
+    const chunk = rawJobs.slice(i, i + ATS_JOB_BATCH);
+    const inputs = [];
+    for (const j of chunk) {
+      inputs.push(buildJobSkillDocument(j._row), buildJobRoleDocument(j._row));
+    }
+
+    const emb = await client.embeddings.create({
+      model: EMBED_MODEL,
+      input: inputs,
+    });
+
+    for (let k = 0; k < chunk.length; k++) {
+      const job = chunk[k];
+      const skillVec = emb.data[k * 2].embedding;
+      const roleVec = emb.data[k * 2 + 1].embedding;
+      const cosSkill = cosineSimilarity(resumeSkillVec, skillVec);
+      const cosRole = cosineSimilarity(resumeRoleVec, roleVec);
+      const skillsMatch = cosineToAtsDimensionPercent(cosSkill);
+      const roleContentMatch = cosineToAtsDimensionPercent(cosRole);
+      const seniorityMatch = estimateSeniorityAlignmentScore(
+        resumeText,
+        job._row?.jobResult?.jobSeniority
+      );
+      const overall = Math.round(
+        0.5 * skillsMatch + 0.35 * roleContentMatch + 0.15 * seniorityMatch
+      );
+      out.set(job.jobId, {
+        skillsMatch,
+        roleContentMatch,
+        seniorityMatch,
+        overall: Math.min(100, Math.max(0, overall)),
+      });
+    }
+  }
+
   return out;
 }
 

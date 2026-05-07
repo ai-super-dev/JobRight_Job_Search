@@ -12,6 +12,7 @@ import {
   shouldExcludePostingForSearchTrack,
 } from "./resume.js";
 import {
+  computeSemanticAtsMatchScores,
   computeSemanticSectionScores,
   expandJobSearchQueries,
   hasSemanticKey,
@@ -339,6 +340,31 @@ function parseJobTitlesFromBody(body) {
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Combine embedding-based score with text overlap. When section text is short, cosine can be
+ * anomalously low — do not let that drag the result below a strong text score (fixes inverted ranking).
+ * When cosine is much higher than text, cap optimism (wrong-lane / generic prose).
+ */
+function blendSemanticFinal(semFinal, textFinal) {
+  const t = Math.max(0, Math.min(100, textFinal));
+  const s = Math.max(0, Math.min(100, semFinal));
+  if (s < t - 15) {
+    return Math.min(100, Math.round(0.88 * t + 0.12 * s + 1));
+  }
+  if (s > t + 14) {
+    return Math.min(100, Math.round(0.52 * s + 0.48 * t + 3));
+  }
+  return Math.min(100, Math.round(0.45 * s + 0.55 * t + 2));
+}
+
+function blendSemanticSection(semV, textV) {
+  const t = Math.max(0, Math.min(100, textV));
+  const s = Math.max(0, Math.min(100, semV));
+  if (s < t - 22) return t;
+  if (s > t + 18) return Math.round(0.55 * s + 0.45 * t);
+  return Math.round(0.46 * s + 0.54 * t);
+}
+
+/**
  * Run JobRight visitor search for several title strings (semantic expansion) and merge by jobId.
  * @param {string} jobTitleInput
  * @param {string} resumeText
@@ -395,7 +421,8 @@ async function runResumeSearchForTitle(resumeText, jobTitleInput, timeWindow, si
       const { score, matchedKeywords, breakdown } = scoreJobAgainstResume(
         signals,
         row,
-        resumeText
+        resumeText,
+        searchTitle
       );
       return {
         ...rest,
@@ -410,25 +437,69 @@ async function runResumeSearchForTitle(resumeText, jobTitleInput, timeWindow, si
 
   let semanticMap = new Map();
   let semanticUsed = false;
-  try {
-    semanticMap = await computeSemanticSectionScores(rawJobsFiltered, resumeText);
-    semanticUsed = hasSemanticKey() && semanticMap.size > 0;
-  } catch {
-    semanticMap = new Map();
-    semanticUsed = false;
+  let semanticAtsMode = false;
+  if (hasSemanticKey() && rawJobsFiltered.length > 0) {
+    try {
+      semanticMap = await computeSemanticAtsMatchScores(rawJobsFiltered, resumeText, signals);
+      semanticAtsMode = semanticMap.size > 0;
+      semanticUsed = semanticAtsMode;
+    } catch {
+      semanticMap = new Map();
+      semanticAtsMode = false;
+    }
+    if (!semanticAtsMode) {
+      try {
+        semanticMap = await computeSemanticSectionScores(rawJobsFiltered, resumeText);
+        semanticUsed = semanticMap.size > 0;
+      } catch {
+        semanticMap = new Map();
+        semanticUsed = false;
+      }
+    }
   }
 
   const jobs = textScored
     .map((j) => {
       const sem = semanticMap.get(j.jobId);
       if (!sem) return j;
+      const textFinal = j.textScore ?? j.matchScore;
+      const ts = j.textSectionScores || j.sectionScores;
+
+      if (semanticAtsMode && "overall" in sem && "skillsMatch" in sem) {
+        const blendedFinal = Math.min(
+          100,
+          Math.round(0.88 * sem.overall + 0.12 * textFinal)
+        );
+        return {
+          ...j,
+          matchScore: blendedFinal,
+          scoringModel: "semantic_ats_v1",
+          semanticAtsMode: true,
+          atsDimensions: {
+            skillsMatch: sem.skillsMatch,
+            roleContentMatch: sem.roleContentMatch,
+            seniorityMatch: sem.seniorityMatch,
+            semanticCore: sem.overall,
+          },
+          sectionScores: {
+            responsibilities: sem.roleContentMatch,
+            qualifications: sem.skillsMatch,
+            requiredPreferred: sem.seniorityMatch,
+          },
+        };
+      }
+
+      const blendedFinal = blendSemanticFinal(sem.final, textFinal);
       return {
         ...j,
-        matchScore: sem.final,
+        matchScore: blendedFinal,
+        semanticRawFinal: sem.final,
+        scoringModel: "semantic_sections_v1",
+        semanticAtsMode: false,
         sectionScores: {
-          responsibilities: sem.responsibilities,
-          qualifications: sem.qualifications,
-          requiredPreferred: sem.requiredPreferred,
+          responsibilities: blendSemanticSection(sem.responsibilities, ts.responsibilities),
+          qualifications: blendSemanticSection(sem.qualifications, ts.qualifications),
+          requiredPreferred: blendSemanticSection(sem.requiredPreferred, ts.requiredPreferred),
         },
       };
     })
@@ -444,6 +515,7 @@ async function runResumeSearchForTitle(resumeText, jobTitleInput, timeWindow, si
     expandedQueries,
     titleExpansionUsedLlm,
     semanticUsed,
+    semanticAtsMode,
     totalBeforeCompanyDedup: jobs.length,
     totalAfterCompanyDedup: dedupedJobs.length,
     jobs: jobsInSelectedWindow,
@@ -537,11 +609,13 @@ app.post(
 
       const resultsByTitle = [];
       let semanticUsedAny = false;
+      let semanticAtsAny = false;
 
       for (let i = 0; i < jobTitles.length; i++) {
         if (i > 0) await delay(200);
         const block = await runResumeSearchForTitle(resumeText, jobTitles[i], tw, signals);
         semanticUsedAny = semanticUsedAny || block.semanticUsed;
+        semanticAtsAny = semanticAtsAny || block.semanticAtsMode;
         const jobsTagged = block.jobs.map((j) => ({
           ...j,
           queryJobTitle: block.jobTitleInput,
@@ -551,6 +625,7 @@ app.post(
           jobTitleInput: block.jobTitleInput,
           searchTitle: block.searchTitle,
           searchRoleTrack: block.searchRoleTrack,
+          semanticAtsMode: block.semanticAtsMode,
           titleSearchQueries: block.expandedQueries,
           titleExpansionUsedLlm: block.titleExpansionUsedLlm,
           count: jobsTagged.length,
@@ -607,6 +682,7 @@ app.post(
           resumeSignals: signals,
           resumePreview,
           semanticUsed: only.semanticUsed,
+          semanticAtsMode: only.semanticAtsMode,
           count: only.jobs.length,
           companyTitleDedupWindow: "7d",
           totalBeforeCompanyDedup: only.totalBeforeCompanyDedup,
@@ -627,6 +703,7 @@ app.post(
         resumeSignals: signals,
         resumePreview,
         semanticUsed: semanticUsedAny,
+        semanticAtsMode: semanticAtsAny,
         count: jobsFlat.length,
         companyTitleDedupWindow: "7d",
         finalCrossTitleDedup:
